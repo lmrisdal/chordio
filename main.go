@@ -29,6 +29,8 @@ const (
 	defaultConfig = ""
 	evKey         = 0x01
 	evAbs         = 0x03
+
+	testInputAnalogDebounce = 150 * time.Millisecond
 )
 
 var version = "0.1.0"
@@ -56,6 +58,7 @@ Config is searched in this order when --config is omitted:
 type Config struct {
 	ScanIntervalSec int      `json:"scan_interval_sec,omitempty"`
 	Devices         []string `json:"devices,omitempty"`
+	DeviceIDs       []string `json:"device_ids,omitempty"`
 	AllowAllDevices bool     `json:"allow_all_devices,omitempty"`
 	Chords          []Chord  `json:"chords"`
 
@@ -100,6 +103,10 @@ type stringListFlag []string
 type watchedDevice struct {
 	cancel context.CancelFunc
 	done   chan struct{}
+}
+
+type testInputDebouncer struct {
+	lastAnalogPrint map[uint16]time.Time
 }
 
 type inputDeviceInfo struct {
@@ -259,12 +266,15 @@ func main() {
 	}
 	if cfg.AllowAllDevices {
 		log.Printf("Unsafe device mode enabled; scanning /dev/input/event*")
-	} else if len(cfg.Devices) > 0 {
+	} else if len(cfg.Devices) > 0 || len(cfg.DeviceIDs) > 0 {
 		log.Printf("Devices: %s", strings.Join(cfg.Devices, ", "))
+		if len(cfg.DeviceIDs) > 0 {
+			log.Printf("Device IDs: %s", strings.Join(cfg.DeviceIDs, "; "))
+		}
 	}
 
 	interval := time.Duration(cfg.ScanIntervalOrDefault()) * time.Second
-	if err := scanLoop(ctx, cfg.Devices, cfg.AllowAllDevices, runtimes, interval, *debug, *verbose); err != nil {
+	if err := scanLoop(ctx, cfg.Devices, cfg.DeviceIDs, cfg.AllowAllDevices, runtimes, interval, *debug, *verbose); err != nil {
 		log.Fatal(err)
 	}
 }
@@ -303,6 +313,7 @@ func runTestInput(configPath string, devices []string, allDevices bool, verbose 
 	defer stop()
 
 	configuredDevices := devices
+	var configuredDeviceIDs []string
 	allowAllDevices := allDevices
 	if len(configuredDevices) == 0 && configPath != "" {
 		cfg, err := LoadConfig(configPath)
@@ -310,11 +321,13 @@ func runTestInput(configPath string, devices []string, allDevices bool, verbose 
 			return err
 		}
 		configuredDevices = cfg.Devices
+		configuredDeviceIDs = cfg.DeviceIDs
 		allowAllDevices = cfg.AllowAllDevices
 	} else if len(configuredDevices) == 0 && configPath == "" {
 		cfg, err := LoadConfig("")
 		if err == nil {
 			configuredDevices = cfg.Devices
+			configuredDeviceIDs = cfg.DeviceIDs
 			allowAllDevices = cfg.AllowAllDevices
 			if cfg.path != "" {
 				log.Printf("Config: %s", cfg.path)
@@ -322,19 +335,19 @@ func runTestInput(configPath string, devices []string, allDevices bool, verbose 
 		}
 	}
 
-	if len(configuredDevices) == 0 && !allowAllDevices {
+	if len(configuredDevices) == 0 && len(configuredDeviceIDs) == 0 && !allowAllDevices {
 		devices, err := likelyGamepadPaths()
 		if err != nil {
 			return err
 		}
 		configuredDevices = devices
 	}
-	if len(configuredDevices) == 0 && !allowAllDevices {
+	if len(configuredDevices) == 0 && len(configuredDeviceIDs) == 0 && !allowAllDevices {
 		return errors.New("no likely gamepads found; run 'chordio --list-devices' or pass 'chordio test-input --device /dev/input/eventX'")
 	}
 
 	log.Printf("Input test mode: press controller buttons or move sticks/triggers; press Ctrl-C to stop")
-	return testInputLoop(ctx, configuredDevices, allowAllDevices, verbose)
+	return testInputLoop(ctx, configuredDevices, configuredDeviceIDs, allowAllDevices, verbose)
 }
 
 func likelyGamepadPaths() ([]string, error) {
@@ -415,6 +428,10 @@ func printDevices(includeAll bool) error {
 	fmt.Println()
 	fmt.Println(`  "devices": ["/dev/input/by-id/...-event-joystick"]`)
 	fmt.Println()
+	fmt.Println("If no stable path is listed, use the printed id instead:")
+	fmt.Println()
+	fmt.Println(`  "device_ids": ["vendor=045e product=0b22 uniq=f4:6a:d7:1f:1c:ac"]`)
+	fmt.Println()
 
 	shown := 0
 	for _, dev := range devices {
@@ -455,6 +472,7 @@ func printDevice(dev inputDeviceInfo) {
 	fmt.Printf("  access: %s\n", status)
 	if ids := dev.idSummary(); ids != "" {
 		fmt.Printf("  id: %s\n", ids)
+		fmt.Printf("  config id: %q\n", dev.configID())
 	}
 	if dev.Phys != "" {
 		fmt.Printf("  phys: %s\n", dev.Phys)
@@ -668,6 +686,62 @@ func (d inputDeviceInfo) idSummary() string {
 	return strings.Join(parts, " ")
 }
 
+func (d inputDeviceInfo) configID() string {
+	var parts []string
+	if d.Vendor != "" {
+		parts = append(parts, "vendor="+d.Vendor)
+	}
+	if d.Product != "" {
+		parts = append(parts, "product="+d.Product)
+	}
+	if d.Uniq != "" {
+		parts = append(parts, "uniq="+d.Uniq)
+	}
+	if len(parts) == 0 {
+		return d.idSummary()
+	}
+	return strings.Join(parts, " ")
+}
+
+func (d inputDeviceInfo) matchesID(raw string) bool {
+	want := parseIDMatcher(raw)
+	if len(want) == 0 {
+		return false
+	}
+	have := map[string]string{
+		"bus":     strings.ToLower(d.Bus),
+		"vendor":  strings.ToLower(d.Vendor),
+		"product": strings.ToLower(d.Product),
+		"version": strings.ToLower(d.Version),
+		"uniq":    strings.ToLower(d.Uniq),
+	}
+	for key, value := range want {
+		if have[key] != value {
+			return false
+		}
+	}
+	return true
+}
+
+func parseIDMatcher(raw string) map[string]string {
+	out := make(map[string]string)
+	for _, field := range strings.Fields(strings.ToLower(strings.TrimSpace(raw))) {
+		key, value, ok := strings.Cut(field, "=")
+		if !ok {
+			continue
+		}
+		key = strings.TrimSpace(key)
+		value = strings.Trim(strings.TrimSpace(value), `"'`)
+		switch key {
+		case "bus", "vendor", "product", "version", "uniq":
+			if value != "" {
+				out[key] = value
+			}
+		}
+	}
+	return out
+}
+
 func compileChords(chords []Chord) ([]chordRuntime, error) {
 	var out []chordRuntime
 	for i, chord := range chords {
@@ -762,13 +836,13 @@ func (a Action) describe() string {
 	}
 }
 
-func scanLoop(ctx context.Context, configuredDevices []string, allowAllDevices bool, chords []chordRuntime, scanInterval time.Duration, debug, verbose bool) error {
+func scanLoop(ctx context.Context, configuredDevices []string, configuredDeviceIDs []string, allowAllDevices bool, chords []chordRuntime, scanInterval time.Duration, debug, verbose bool) error {
 	ticker := time.NewTicker(scanInterval)
 	defer ticker.Stop()
 
 	watched := make(map[string]watchedDevice)
 	for {
-		if err := scanOnce(ctx, configuredDevices, allowAllDevices, watched, chords, debug, verbose); err != nil {
+		if err := scanOnce(ctx, configuredDevices, configuredDeviceIDs, allowAllDevices, watched, chords, debug, verbose); err != nil {
 			return err
 		}
 
@@ -790,13 +864,13 @@ func scanLoop(ctx context.Context, configuredDevices []string, allowAllDevices b
 	}
 }
 
-func testInputLoop(ctx context.Context, configuredDevices []string, allowAllDevices bool, verbose bool) error {
+func testInputLoop(ctx context.Context, configuredDevices []string, configuredDeviceIDs []string, allowAllDevices bool, verbose bool) error {
 	watched := make(map[string]watchedDevice)
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 
 	for {
-		if err := testInputScanOnce(ctx, configuredDevices, allowAllDevices, watched, verbose); err != nil {
+		if err := testInputScanOnce(ctx, configuredDevices, configuredDeviceIDs, allowAllDevices, watched, verbose); err != nil {
 			return err
 		}
 
@@ -818,7 +892,7 @@ func testInputLoop(ctx context.Context, configuredDevices []string, allowAllDevi
 	}
 }
 
-func testInputScanOnce(parent context.Context, configuredDevices []string, allowAllDevices bool, watched map[string]watchedDevice, verbose bool) error {
+func testInputScanOnce(parent context.Context, configuredDevices []string, configuredDeviceIDs []string, allowAllDevices bool, watched map[string]watchedDevice, verbose bool) error {
 	for path, dev := range watched {
 		select {
 		case <-dev.done:
@@ -827,7 +901,7 @@ func testInputScanOnce(parent context.Context, configuredDevices []string, allow
 		}
 	}
 
-	paths, err := devicePaths(configuredDevices, allowAllDevices)
+	paths, err := devicePaths(configuredDevices, configuredDeviceIDs, allowAllDevices)
 	if err != nil {
 		return err
 	}
@@ -853,7 +927,7 @@ func testInputScanOnce(parent context.Context, configuredDevices []string, allow
 	return nil
 }
 
-func scanOnce(parent context.Context, configuredDevices []string, allowAllDevices bool, watched map[string]watchedDevice, chords []chordRuntime, debug, verbose bool) error {
+func scanOnce(parent context.Context, configuredDevices []string, configuredDeviceIDs []string, allowAllDevices bool, watched map[string]watchedDevice, chords []chordRuntime, debug, verbose bool) error {
 	for path, dev := range watched {
 		select {
 		case <-dev.done:
@@ -862,7 +936,7 @@ func scanOnce(parent context.Context, configuredDevices []string, allowAllDevice
 		}
 	}
 
-	paths, err := devicePaths(configuredDevices, allowAllDevices)
+	paths, err := devicePaths(configuredDevices, configuredDeviceIDs, allowAllDevices)
 	if err != nil {
 		return err
 	}
@@ -889,21 +963,63 @@ func scanOnce(parent context.Context, configuredDevices []string, allowAllDevice
 	return nil
 }
 
-func devicePaths(configured []string, allowAll bool) ([]string, error) {
-	if len(configured) > 0 {
-		var paths []string
-		for _, rawPath := range configured {
-			path := strings.TrimSpace(rawPath)
-			if path != "" {
-				paths = append(paths, path)
+func devicePaths(configured []string, configuredIDs []string, allowAll bool) ([]string, error) {
+	var paths []string
+	seen := make(map[string]bool)
+	for _, rawPath := range configured {
+		path := strings.TrimSpace(rawPath)
+		if path != "" && !seen[path] {
+			paths = append(paths, path)
+			seen[path] = true
+		}
+	}
+
+	ids := nonEmptyStrings(configuredIDs)
+	if len(ids) > 0 {
+		devices, err := discoverInputDevices()
+		if err != nil {
+			return nil, err
+		}
+		for _, id := range ids {
+			matched := false
+			for _, dev := range devices {
+				if !dev.matchesID(id) {
+					continue
+				}
+				matched = true
+				path := dev.EventPath
+				if len(dev.StablePaths) > 0 {
+					path = dev.StablePaths[0]
+				}
+				if path != "" && !seen[path] {
+					paths = append(paths, path)
+					seen[path] = true
+				}
+			}
+			if !matched {
+				log.Printf("No input device currently matches id %q", id)
 			}
 		}
+	}
+
+	if len(paths) > 0 {
 		return paths, nil
 	}
 	if !allowAll {
-		return nil, errors.New("no devices configured; run 'chordio --list-devices' and add a controller path to config")
+		return nil, errors.New("no devices configured; run 'chordio --list-devices' and add a controller path or device id to config")
 	}
 	return filepath.Glob("/dev/input/event*")
+}
+
+func nonEmptyStrings(values []string) []string {
+	var out []string
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value != "" {
+			out = append(out, value)
+		}
+	}
+	return out
 }
 
 func cloneChords(in []chordRuntime) []chordRuntime {
@@ -987,6 +1103,7 @@ func watchTestInputDevice(ctx context.Context, path string, file *os.File, verbo
 	defer close(stopCloser)
 
 	reader := bufio.NewReader(file)
+	debouncer := testInputDebouncer{lastAnalogPrint: make(map[uint16]time.Time)}
 	for {
 		select {
 		case <-ctx.Done():
@@ -1004,7 +1121,35 @@ func watchTestInputDevice(ctx context.Context, path string, file *os.File, verbo
 		if event.Type != evKey && event.Type != evAbs {
 			continue
 		}
+		if !debouncer.shouldPrint(event, time.Now()) {
+			continue
+		}
 		fmt.Printf("%s type=%s(%d) code=%s(%d) value=%d\n", path, eventTypeName(event.Type), event.Type, eventCodeName(event), event.Code, event.Value)
+	}
+}
+
+func (d *testInputDebouncer) shouldPrint(event inputEvent, now time.Time) bool {
+	if event.Type != evAbs || !isAnalogStickAxis(event.Code) {
+		return true
+	}
+	if d.lastAnalogPrint == nil {
+		d.lastAnalogPrint = make(map[uint16]time.Time)
+	}
+
+	last, ok := d.lastAnalogPrint[event.Code]
+	if ok && now.Sub(last) < testInputAnalogDebounce {
+		return false
+	}
+	d.lastAnalogPrint[event.Code] = now
+	return true
+}
+
+func isAnalogStickAxis(code uint16) bool {
+	switch code {
+	case 0x00, 0x01, 0x03, 0x04:
+		return true
+	default:
+		return false
 	}
 }
 

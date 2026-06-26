@@ -67,11 +67,20 @@ paths such as:
 /dev/input/by-id/usb-Microsoft_X-Box_Controller-event-joystick
 ```
 
-Copy a stable controller path into your config:
+If `stable paths:` is shown, copy one of those controller paths into `devices`:
 
 ```json
 {
   "devices": ["/dev/input/by-id/usb-Microsoft_X-Box_Controller-event-joystick"]
+}
+```
+
+If no stable path is shown, copy the printed `config id` into `device_ids`
+instead:
+
+```json
+{
+  "device_ids": ["vendor=045e product=0b22 uniq=f4:6a:d7:1f:1c:ac"]
 }
 ```
 
@@ -111,6 +120,7 @@ Example config:
 {
   "scan_interval_sec": 2,
   "devices": ["/dev/input/by-id/usb-Microsoft_X-Box_Controller-event-joystick"],
+  "device_ids": [],
   "chords": [
     {
       "name": "volume-up",
@@ -127,11 +137,12 @@ Example config:
 
 Top-level fields:
 
-| Field               | Meaning                                                                                                            |
-| ------------------- | ------------------------------------------------------------------------------------------------------------------ |
-| `devices`           | Controller input devices Chordio may read. Prefer stable `/dev/input/by-id/...` or `/dev/input/by-path/...` paths. |
-| `scan_interval_sec` | How often Chordio checks for newly connected configured devices.                                                   |
-| `chords`            | Chord definitions.                                                                                                 |
+| Field               | Meaning                                                                                                                          |
+| ------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
+| `devices`           | Controller input device paths. Prefer stable `/dev/input/by-id/...` or `/dev/input/by-path/...` paths.                           |
+| `device_ids`        | Controller identity matchers copied from `chordio --list-devices`, used when no stable path exists.                              |
+| `scan_interval_sec` | How often Chordio checks for newly connected configured devices.                                                                 |
+| `chords`            | Chord definitions.                                                                                                               |
 
 Chord fields:
 
