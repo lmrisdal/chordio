@@ -1,0 +1,38 @@
+{
+  "scan_interval_sec": 2,
+  "devices": [
+    "/dev/input/by-id/usb-Microsoft_X-Box_Controller-event-joystick"
+  ],
+  "chords": [
+    {
+      "name": "volume-up",
+      "chord": ["BTN_THUMBL", "BTN_TR", "BTN_WEST"],
+      "cooldown_ms": 1000,
+      "action": {
+        "type": "exec",
+        "command": ["wpctl", "set-volume", "@DEFAULT_AUDIO_SINK@", "5%+"]
+      }
+    },
+    {
+      "name": "toggle-audio-mute",
+      "enabled": false,
+      "chord": ["BTN_SELECT", "BTN_TR"],
+      "cooldown_ms": 1000,
+      "action": {
+        "type": "exec",
+        "command": ["wpctl", "set-mute", "@DEFAULT_AUDIO_SINK@", "toggle"]
+      }
+    },
+    {
+      "name": "custom-script",
+      "enabled": false,
+      "chord": ["BTN_MODE", "BTN_TL", "BTN_TR"],
+      "cooldown_ms": 1000,
+      "action": {
+        "type": "script",
+        "path": "/home/USER/.local/share/chordio/scripts/example.sh",
+        "args": []
+      }
+    }
+  ]
+}
