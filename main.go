@@ -23,6 +23,7 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	"unsafe"
 )
 
 const (
@@ -30,7 +31,9 @@ const (
 	evKey         = 0x01
 	evAbs         = 0x03
 
-	testInputAnalogDebounce = 150 * time.Millisecond
+	testInputAnalogDebounce       = 150 * time.Millisecond
+	testInputAnalogDeadzonePct    = 15
+	testInputFallbackAxisDeadzone = 8192
 )
 
 var version = "0.1.0"
@@ -106,7 +109,25 @@ type watchedDevice struct {
 }
 
 type testInputDebouncer struct {
-	lastAnalogPrint map[uint16]time.Time
+	axes                map[uint16]analogAxis
+	lastAnalogPrint     map[uint16]time.Time
+	lastAnalogDirection map[uint16]string
+}
+
+type analogAxis struct {
+	center       int32
+	deadzone     int32
+	negativeName string
+	positiveName string
+}
+
+type inputAbsInfo struct {
+	Value      int32
+	Minimum    int32
+	Maximum    int32
+	Fuzz       int32
+	Flat       int32
+	Resolution int32
 }
 
 type inputDeviceInfo struct {
@@ -1103,7 +1124,7 @@ func watchTestInputDevice(ctx context.Context, path string, file *os.File, verbo
 	defer close(stopCloser)
 
 	reader := bufio.NewReader(file)
-	debouncer := testInputDebouncer{lastAnalogPrint: make(map[uint16]time.Time)}
+	debouncer := newTestInputDebouncer(file, verbose)
 	for {
 		select {
 		case <-ctx.Done():
@@ -1121,27 +1142,119 @@ func watchTestInputDevice(ctx context.Context, path string, file *os.File, verbo
 		if event.Type != evKey && event.Type != evAbs {
 			continue
 		}
-		if !debouncer.shouldPrint(event, time.Now()) {
+		shouldPrint, direction := debouncer.shouldPrint(event, time.Now())
+		if !shouldPrint {
+			continue
+		}
+		if direction != "" {
+			fmt.Printf("%s type=%s(%d) code=%s(%d) value=%d direction=%s\n", path, eventTypeName(event.Type), event.Type, eventCodeName(event), event.Code, event.Value, direction)
 			continue
 		}
 		fmt.Printf("%s type=%s(%d) code=%s(%d) value=%d\n", path, eventTypeName(event.Type), event.Type, eventCodeName(event), event.Code, event.Value)
 	}
 }
 
-func (d *testInputDebouncer) shouldPrint(event inputEvent, now time.Time) bool {
+func newTestInputDebouncer(file *os.File, verbose bool) testInputDebouncer {
+	debouncer := testInputDebouncer{
+		axes:                defaultAnalogAxes(),
+		lastAnalogPrint:     make(map[uint16]time.Time),
+		lastAnalogDirection: make(map[uint16]string),
+	}
+	for code, axis := range debouncer.axes {
+		info, err := readAbsInfo(file, code)
+		if err != nil {
+			if verbose {
+				log.Printf("Using fallback analog range for %s: %v", eventCodeName(inputEvent{Type: evAbs, Code: code}), err)
+			}
+			continue
+		}
+		axis.center, axis.deadzone = analogCenterAndDeadzone(info.Minimum, info.Maximum, info.Flat)
+		debouncer.axes[code] = axis
+	}
+	return debouncer
+}
+
+func defaultAnalogAxes() map[uint16]analogAxis {
+	return map[uint16]analogAxis{
+		0x00: {center: 0, deadzone: testInputFallbackAxisDeadzone, negativeName: "left", positiveName: "right"},
+		0x01: {center: 0, deadzone: testInputFallbackAxisDeadzone, negativeName: "up", positiveName: "down"},
+		0x03: {center: 0, deadzone: testInputFallbackAxisDeadzone, negativeName: "left", positiveName: "right"},
+		0x04: {center: 0, deadzone: testInputFallbackAxisDeadzone, negativeName: "up", positiveName: "down"},
+	}
+}
+
+func analogCenterAndDeadzone(minimum, maximum, flat int32) (int32, int32) {
+	if maximum <= minimum {
+		return 0, testInputFallbackAxisDeadzone
+	}
+	axisRange := int64(maximum) - int64(minimum)
+	deadzone := int32(axisRange * testInputAnalogDeadzonePct / 100)
+	if flat > deadzone {
+		deadzone = flat
+	}
+	if deadzone < 1 {
+		deadzone = 1
+	}
+	return int32(int64(minimum) + axisRange/2), deadzone
+}
+
+func readAbsInfo(file *os.File, code uint16) (inputAbsInfo, error) {
+	var info inputAbsInfo
+	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, file.Fd(), evIOCGRawAbs(code), uintptr(unsafe.Pointer(&info)))
+	if errno != 0 {
+		return inputAbsInfo{}, errno
+	}
+	return info, nil
+}
+
+func evIOCGRawAbs(code uint16) uintptr {
+	return (2 << 30) | (uintptr(unsafe.Sizeof(inputAbsInfo{})) << 16) | (uintptr('E') << 8) | uintptr(0x40+code)
+}
+
+func (d *testInputDebouncer) shouldPrint(event inputEvent, now time.Time) (bool, string) {
 	if event.Type != evAbs || !isAnalogStickAxis(event.Code) {
-		return true
+		return true, ""
 	}
 	if d.lastAnalogPrint == nil {
 		d.lastAnalogPrint = make(map[uint16]time.Time)
 	}
-
-	last, ok := d.lastAnalogPrint[event.Code]
-	if ok && now.Sub(last) < testInputAnalogDebounce {
-		return false
+	if d.lastAnalogDirection == nil {
+		d.lastAnalogDirection = make(map[uint16]string)
 	}
+
+	direction := d.analogDirection(event)
+	lastDirection, hadDirection := d.lastAnalogDirection[event.Code]
+	if direction == "neutral" && !hadDirection {
+		return false, ""
+	}
+	if hadDirection && direction == lastDirection {
+		return false, ""
+	}
+	last, ok := d.lastAnalogPrint[event.Code]
+	if direction != "neutral" && ok && now.Sub(last) < testInputAnalogDebounce {
+		return false, ""
+	}
+	d.lastAnalogDirection[event.Code] = direction
 	d.lastAnalogPrint[event.Code] = now
-	return true
+	return true, direction
+}
+
+func (d *testInputDebouncer) analogDirection(event inputEvent) string {
+	axis, ok := d.axes[event.Code]
+	if !ok {
+		axis = defaultAnalogAxes()[event.Code]
+	}
+	delta := int64(event.Value) - int64(axis.center)
+	if delta < 0 {
+		if -delta <= int64(axis.deadzone) {
+			return "neutral"
+		}
+		return axis.negativeName
+	}
+	if delta <= int64(axis.deadzone) {
+		return "neutral"
+	}
+	return axis.positiveName
 }
 
 func isAnalogStickAxis(code uint16) bool {
