@@ -90,9 +90,15 @@ type Action struct {
 
 type chordRuntime struct {
 	chord    Chord
-	codes    []uint16
+	inputs   []chordInput
 	held     bool
 	lastFire time.Time
+}
+
+type chordInput struct {
+	Type  uint16
+	Code  uint16
+	Value int32
 }
 
 type inputEvent struct {
@@ -196,6 +202,15 @@ var absCodeNames = map[uint16]string{
 	0x17: "ABS_HAT3Y",
 }
 
+var absCodes = reverseAbsCodeNames()
+
+var dpadInputs = map[string]chordInput{
+	"DPAD_LEFT":  {Type: evAbs, Code: 0x10, Value: -1},
+	"DPAD_RIGHT": {Type: evAbs, Code: 0x10, Value: 1},
+	"DPAD_UP":    {Type: evAbs, Code: 0x11, Value: -1},
+	"DPAD_DOWN":  {Type: evAbs, Code: 0x11, Value: 1},
+}
+
 func main() {
 	log.SetFlags(log.LstdFlags)
 
@@ -238,7 +253,7 @@ func main() {
 	listAllDevices := flag.Bool("list-all-devices", false, "include non-gamepad input devices in --list-devices output")
 	testInput := flag.Bool("test-input", false, "print gamepad input events and their evdev codes")
 	versionFlag := flag.Bool("version", false, "print version")
-	debug := flag.Bool("debug", false, "print key events and do not run actions")
+	debug := flag.Bool("debug", false, "print input events and do not run actions")
 	verbose := flag.Bool("verbose", false, "log skipped devices and read errors")
 	flag.Parse()
 
@@ -280,10 +295,10 @@ func main() {
 		log.Printf("Config: %s", cfg.path)
 	}
 	if *debug {
-		log.Printf("Debug mode: printing key press/release events and not running actions")
+		log.Printf("Debug mode: printing input press/release events and not running actions")
 	}
 	for _, runtime := range runtimes {
-		log.Printf("Chord %q: %s -> %s", runtime.chord.Name, formatChord(runtime.codes), runtime.chord.Action.describe())
+		log.Printf("Chord %q: %s -> %s", runtime.chord.Name, formatChord(runtime.inputs), runtime.chord.Action.describe())
 	}
 	if cfg.AllowAllDevices {
 		log.Printf("Unsafe device mode enabled; scanning /dev/input/event*")
@@ -776,38 +791,88 @@ func compileChords(chords []Chord) ([]chordRuntime, error) {
 		if len(inputs) == 0 {
 			inputs = chord.Inputs
 		}
-		codes, err := parseChord(inputs)
+		compiledInputs, err := parseChord(inputs)
 		if err != nil {
 			return nil, fmt.Errorf("chord %q: %w", chord.Name, err)
 		}
 		if err := chord.Action.validate(); err != nil {
 			return nil, fmt.Errorf("chord %q: %w", chord.Name, err)
 		}
-		out = append(out, chordRuntime{chord: chord, codes: codes})
+		out = append(out, chordRuntime{chord: chord, inputs: compiledInputs})
 	}
 	return out, nil
 }
 
-func parseChord(names []string) ([]uint16, error) {
-	var chord []uint16
+func parseChord(names []string) ([]chordInput, error) {
+	var chord []chordInput
 	for _, part := range names {
 		name := strings.ToUpper(strings.TrimSpace(part))
 		if name == "" {
 			continue
 		}
-		code, ok := keyCodes[name]
-		if !ok {
-			return nil, fmt.Errorf("unknown evdev key name %q", name)
+		input, err := parseChordInput(name)
+		if err != nil {
+			return nil, err
 		}
-		if !slices.Contains(chord, code) {
-			chord = append(chord, code)
+		if !slices.Contains(chord, input) {
+			chord = append(chord, input)
 		}
 	}
 	if len(chord) == 0 {
-		return nil, errors.New("chord must contain at least one key")
+		return nil, errors.New("chord must contain at least one input")
 	}
-	slices.Sort(chord)
+	slices.SortFunc(chord, compareChordInput)
 	return chord, nil
+}
+
+func parseChordInput(name string) (chordInput, error) {
+	if input, ok := dpadInputs[name]; ok {
+		return input, nil
+	}
+	if code, ok := keyCodes[name]; ok {
+		return chordInput{Type: evKey, Code: code, Value: 1}, nil
+	}
+	if input, ok, err := parseAbsChordInput(name); ok || err != nil {
+		return input, err
+	}
+	return chordInput{}, fmt.Errorf("unknown evdev input name %q", name)
+}
+
+func parseAbsChordInput(name string) (chordInput, bool, error) {
+	name = strings.TrimPrefix(name, "EV_ABS:")
+	name = strings.TrimPrefix(name, "ABS:")
+	axisName, rawValue, ok := strings.Cut(name, ":")
+	if !ok {
+		return chordInput{}, false, nil
+	}
+	code, ok := absCodes[axisName]
+	if !ok {
+		return chordInput{}, true, fmt.Errorf("unknown evdev abs name %q", axisName)
+	}
+	value, err := strconv.ParseInt(rawValue, 10, 32)
+	if err != nil {
+		return chordInput{}, true, fmt.Errorf("invalid abs value %q for %s", rawValue, axisName)
+	}
+	if value == 0 {
+		return chordInput{}, true, fmt.Errorf("abs input %s must use a non-zero value", axisName)
+	}
+	return chordInput{Type: evAbs, Code: code, Value: int32(value)}, true, nil
+}
+
+func compareChordInput(a, b chordInput) int {
+	if a.Type != b.Type {
+		return int(a.Type) - int(b.Type)
+	}
+	if a.Code != b.Code {
+		return int(a.Code) - int(b.Code)
+	}
+	if a.Value < b.Value {
+		return -1
+	}
+	if a.Value > b.Value {
+		return 1
+	}
+	return 0
 }
 
 func (a Action) validate() error {
@@ -1064,7 +1129,7 @@ func watchDevice(ctx context.Context, path string, file *os.File, chords []chord
 	}()
 	defer close(stopCloser)
 
-	pressed := make(map[uint16]bool)
+	pressed := make(map[chordInput]bool)
 	reader := bufio.NewReader(file)
 
 	for {
@@ -1081,29 +1146,62 @@ func watchDevice(ctx context.Context, path string, file *os.File, chords []chord
 			}
 			return
 		}
-		if event.Type != evKey {
+		if event.Type != evKey && event.Type != evAbs {
 			continue
 		}
 
-		if debug && (event.Value == 0 || event.Value == 1) {
-			action := "released"
-			if event.Value == 1 {
-				action = "pressed"
+		changed := updatePressedInputs(pressed, event)
+		if !changed {
+			continue
+		}
+
+		if debug {
+			if event.Type == evKey {
+				action := "released"
+				if event.Value == 1 {
+					action = "pressed"
+				}
+				log.Printf("%s %s on %s", keyName(event.Code), action, path)
+			} else {
+				log.Printf("%s value %d on %s", eventCodeName(event), event.Value, path)
 			}
-			log.Printf("%s %s on %s", keyName(event.Code), action, path)
-		}
-
-		switch event.Value {
-		case 1:
-			pressed[event.Code] = true
-		case 0:
-			delete(pressed, event.Code)
-		default:
-			continue
 		}
 
 		for i := range chords {
 			handleChord(path, pressed, &chords[i], debug)
+		}
+	}
+}
+
+func updatePressedInputs(pressed map[chordInput]bool, event inputEvent) bool {
+	switch event.Type {
+	case evKey:
+		input := chordInput{Type: evKey, Code: event.Code, Value: 1}
+		switch event.Value {
+		case 1:
+			pressed[input] = true
+			return true
+		case 0:
+			delete(pressed, input)
+			return true
+		default:
+			return false
+		}
+	case evAbs:
+		clearPressedAxis(pressed, event.Code)
+		if event.Value != 0 {
+			pressed[chordInput{Type: evAbs, Code: event.Code, Value: event.Value}] = true
+		}
+		return true
+	default:
+		return false
+	}
+}
+
+func clearPressedAxis(pressed map[chordInput]bool, code uint16) {
+	for input := range pressed {
+		if input.Type == evAbs && input.Code == code {
+			delete(pressed, input)
 		}
 	}
 }
@@ -1302,8 +1400,8 @@ func (d *testInputDebouncer) axis(code uint16) (analogAxis, bool) {
 	return axis, ok
 }
 
-func handleChord(path string, pressed map[uint16]bool, runtime *chordRuntime, debug bool) {
-	isHeld := chordPressed(runtime.codes, pressed)
+func handleChord(path string, pressed map[chordInput]bool, runtime *chordRuntime, debug bool) {
+	isHeld := chordPressed(runtime.inputs, pressed)
 	if !isHeld {
 		runtime.held = false
 		return
@@ -1319,7 +1417,7 @@ func handleChord(path string, pressed map[uint16]bool, runtime *chordRuntime, de
 	}
 	runtime.lastFire = time.Now()
 
-	log.Printf("Chord %q held on %s: %s", runtime.chord.Name, path, formatChord(runtime.codes))
+	log.Printf("Chord %q held on %s: %s", runtime.chord.Name, path, formatChord(runtime.inputs))
 	if !debug {
 		runAction(runtime.chord)
 	}
@@ -1337,9 +1435,9 @@ func readInputEvent(r *bufio.Reader) (inputEvent, error) {
 	}, nil
 }
 
-func chordPressed(chord []uint16, pressed map[uint16]bool) bool {
-	for _, code := range chord {
-		if !pressed[code] {
+func chordPressed(chord []chordInput, pressed map[chordInput]bool) bool {
+	for _, input := range chord {
+		if !pressed[input] {
 			return false
 		}
 	}
@@ -1406,6 +1504,14 @@ func reverseKeyCodes() map[uint16]string {
 	return names
 }
 
+func reverseAbsCodeNames() map[string]uint16 {
+	codes := make(map[string]uint16, len(absCodeNames))
+	for code, name := range absCodeNames {
+		codes[name] = code
+	}
+	return codes
+}
+
 func keyName(code uint16) string {
 	if name, ok := codeNames[code]; ok {
 		return name
@@ -1432,10 +1538,26 @@ func eventCodeName(event inputEvent) string {
 	return strconv.Itoa(int(event.Code))
 }
 
-func formatChord(chord []uint16) string {
+func formatChord(chord []chordInput) string {
 	var names []string
-	for _, code := range chord {
-		names = append(names, keyName(code))
+	for _, input := range chord {
+		names = append(names, chordInputName(input))
 	}
 	return strings.Join(names, ", ")
+}
+
+func chordInputName(input chordInput) string {
+	for name, dpadInput := range dpadInputs {
+		if input == dpadInput {
+			return name
+		}
+	}
+	switch input.Type {
+	case evKey:
+		return keyName(input.Code)
+	case evAbs:
+		return fmt.Sprintf("%s:%d", eventCodeName(inputEvent{Type: evAbs, Code: input.Code}), input.Value)
+	default:
+		return fmt.Sprintf("%s:%d:%d", eventTypeName(input.Type), input.Code, input.Value)
+	}
 }

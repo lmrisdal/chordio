@@ -3,6 +3,7 @@
 package main
 
 import (
+	"slices"
 	"testing"
 	"time"
 )
@@ -28,6 +29,48 @@ func TestInputDeviceMatchesID(t *testing.T) {
 
 	if dev.matchesID("vendor=045e product=ffff") {
 		t.Fatal("matchesID with the wrong product: got true, want false")
+	}
+}
+
+func TestParseChordSupportsButtonsDpadAliasesAndRawAbsInputs(t *testing.T) {
+	inputs, err := parseChord([]string{"BTN_TL", "DPAD_UP", "ABS_HAT0X:-1", "abs:ABS_HAT0Y:1"})
+	if err != nil {
+		t.Fatalf("parseChord: %v", err)
+	}
+
+	want := []chordInput{
+		{Type: evKey, Code: keyCodes["BTN_TL"], Value: 1},
+		{Type: evAbs, Code: 0x10, Value: -1},
+		{Type: evAbs, Code: 0x11, Value: -1},
+		{Type: evAbs, Code: 0x11, Value: 1},
+	}
+	for _, input := range want {
+		if !slices.Contains(inputs, input) {
+			t.Fatalf("parseChord missing %#v in %#v", input, inputs)
+		}
+	}
+}
+
+func TestUpdatePressedInputsTracksDpadDirections(t *testing.T) {
+	pressed := make(map[chordInput]bool)
+	up := dpadInputs["DPAD_UP"]
+	down := dpadInputs["DPAD_DOWN"]
+
+	if !updatePressedInputs(pressed, inputEvent{Type: evAbs, Code: 0x11, Value: -1}) {
+		t.Fatal("dpad up event: got unchanged, want changed")
+	}
+	if !pressed[up] || pressed[down] {
+		t.Fatalf("dpad up state: got %#v", pressed)
+	}
+
+	updatePressedInputs(pressed, inputEvent{Type: evAbs, Code: 0x11, Value: 1})
+	if pressed[up] || !pressed[down] {
+		t.Fatalf("dpad down state: got %#v", pressed)
+	}
+
+	updatePressedInputs(pressed, inputEvent{Type: evAbs, Code: 0x11, Value: 0})
+	if pressed[up] || pressed[down] {
+		t.Fatalf("dpad neutral state: got %#v", pressed)
 	}
 }
 

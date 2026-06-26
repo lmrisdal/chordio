@@ -124,7 +124,7 @@ Example config:
   "chords": [
     {
       "name": "volume-up",
-      "chord": ["BTN_THUMBL", "BTN_TR", "BTN_WEST"],
+      "chord": ["BTN_THUMBL", "BTN_TR", "DPAD_UP"],
       "cooldown_ms": 1000,
       "action": {
         "type": "exec",
@@ -149,29 +149,38 @@ Chord fields:
 | Field         | Meaning                                          |
 | ------------- | ------------------------------------------------ |
 | `name`        | Log-friendly chord name.                         |
-| `chord`       | Button names that must be held at the same time. |
+| `chord`       | Input names that must be held at the same time.  |
 | `inputs`      | Alias for `chord`.                               |
 | `enabled`     | Set `false` to keep an example disabled.         |
 | `cooldown_ms` | Suppress repeats within this window.             |
 | `action`      | Action to run when the chord is pressed.         |
 
-Common Xbox-style button names:
+Common Xbox-style input names:
 
-| Button      | evdev key    |
-| ----------- | ------------ |
-| A           | `BTN_SOUTH`  |
-| B           | `BTN_EAST`   |
-| X           | `BTN_WEST`   |
-| Y           | `BTN_NORTH`  |
-| LB          | `BTN_TL`     |
-| RB          | `BTN_TR`     |
-| LT          | `BTN_TL2`    |
-| RT          | `BTN_TR2`    |
-| Select/View | `BTN_SELECT` |
-| Start/Menu  | `BTN_START`  |
-| Guide       | `BTN_MODE`   |
-| L3          | `BTN_THUMBL` |
-| R3          | `BTN_THUMBR` |
+| Input       | Config name   |
+| ----------- | ------------- |
+| A           | `BTN_SOUTH`   |
+| B           | `BTN_EAST`    |
+| X           | `BTN_WEST`    |
+| Y           | `BTN_NORTH`   |
+| LB          | `BTN_TL`      |
+| RB          | `BTN_TR`      |
+| LT          | `BTN_TL2`     |
+| RT          | `BTN_TR2`     |
+| Select/View | `BTN_SELECT`  |
+| Start/Menu  | `BTN_START`   |
+| Guide       | `BTN_MODE`    |
+| L3          | `BTN_THUMBL`  |
+| R3          | `BTN_THUMBR`  |
+| D-pad up    | `DPAD_UP`     |
+| D-pad down  | `DPAD_DOWN`   |
+| D-pad left  | `DPAD_LEFT`   |
+| D-pad right | `DPAD_RIGHT`  |
+
+If your controller reports an input differently, use `chordio test-input` and
+copy the ABS code and value into the chord as `ABS_NAME:value`. For example,
+`DPAD_UP` is equivalent to `ABS_HAT0Y:-1` on common controllers, while
+`DPAD_DOWN` is equivalent to `ABS_HAT0Y:1`.
 
 ## Actions
 
