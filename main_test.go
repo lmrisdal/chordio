@@ -42,11 +42,11 @@ func TestInputDebouncerPrintsAnalogStickDirectionChanges(t *testing.T) {
 	if shouldPrint, _ := debouncer.shouldPrint(inputEvent{Type: evAbs, Code: 0x00, Value: 130}, now); shouldPrint {
 		t.Fatal("initial neutral analog stick event: got true, want false")
 	}
-	shouldPrint, direction := debouncer.shouldPrint(inputEvent{Type: evAbs, Code: 0x00, Value: 170}, now)
+	shouldPrint, direction := debouncer.shouldPrint(inputEvent{Type: evAbs, Code: 0x00, Value: 210}, now)
 	if !shouldPrint || direction != "right" {
 		t.Fatalf("right analog stick event: got (%v, %q), want (true, right)", shouldPrint, direction)
 	}
-	if shouldPrint, _ := debouncer.shouldPrint(inputEvent{Type: evAbs, Code: 0x00, Value: 210}, now.Add(testInputAnalogDebounce)); shouldPrint {
+	if shouldPrint, _ := debouncer.shouldPrint(inputEvent{Type: evAbs, Code: 0x00, Value: 250}, now.Add(testInputAnalogDebounce)); shouldPrint {
 		t.Fatal("same-direction analog stick event: got true, want false")
 	}
 	shouldPrint, direction = debouncer.shouldPrint(inputEvent{Type: evAbs, Code: 0x00, Value: 128}, now.Add(testInputAnalogDebounce+time.Millisecond))
@@ -76,12 +76,12 @@ func TestInputDebouncerDoesNotDebounceButtonsTriggersOrHats(t *testing.T) {
 
 func TestAnalogCenterAndDeadzoneUsesRangeAndFlat(t *testing.T) {
 	center, deadzone := analogCenterAndDeadzone(0, 255, 4)
-	if center != 127 || deadzone != 38 {
-		t.Fatalf("0..255 axis: got center=%d deadzone=%d, want center=127 deadzone=38", center, deadzone)
+	if center != 127 || deadzone != 63 {
+		t.Fatalf("0..255 axis: got center=%d deadzone=%d, want center=127 deadzone=63", center, deadzone)
 	}
 
 	center, deadzone = analogCenterAndDeadzone(-32768, 32767, 9000)
-	if center != -1 || deadzone != 9830 {
-		t.Fatalf("-32768..32767 axis: got center=%d deadzone=%d, want center=-1 deadzone=9830", center, deadzone)
+	if center != -1 || deadzone != 16383 {
+		t.Fatalf("-32768..32767 axis: got center=%d deadzone=%d, want center=-1 deadzone=16383", center, deadzone)
 	}
 }

@@ -32,7 +32,7 @@ const (
 	evAbs         = 0x03
 
 	testInputAnalogDebounce       = 150 * time.Millisecond
-	testInputAnalogDeadzonePct    = 15
+	testInputAnalogDeadzonePct    = 25
 	testInputFallbackAxisDeadzone = 8192
 )
 
@@ -1160,7 +1160,7 @@ func newTestInputDebouncer(file *os.File, verbose bool) testInputDebouncer {
 		lastAnalogPrint:     make(map[uint16]time.Time),
 		lastAnalogDirection: make(map[uint16]string),
 	}
-	for code, axis := range debouncer.axes {
+	for code, axis := range possibleAnalogAxes() {
 		info, err := readAbsInfo(file, code)
 		if err != nil {
 			if verbose {
@@ -1168,8 +1168,20 @@ func newTestInputDebouncer(file *os.File, verbose bool) testInputDebouncer {
 			}
 			continue
 		}
-		axis.center, axis.deadzone = analogCenterAndDeadzone(info.Minimum, info.Maximum, info.Flat)
+		center, deadzone := analogCenterAndDeadzone(info.Minimum, info.Maximum, info.Flat)
+		if optionalAnalogAxis(code) && !axisValueNear(info.Value, center, deadzone) {
+			delete(debouncer.axes, code)
+			continue
+		}
+		if axisValueNear(info.Value, center, deadzone) {
+			center = info.Value
+		}
+		axis.center = center
+		axis.deadzone = deadzone
 		debouncer.axes[code] = axis
+		if verbose {
+			log.Printf("Analog stick axis %s center=%d deadzone=%d", eventCodeName(inputEvent{Type: evAbs, Code: code}), axis.center, axis.deadzone)
+		}
 	}
 	return debouncer
 }
@@ -1180,6 +1192,22 @@ func defaultAnalogAxes() map[uint16]analogAxis {
 		0x01: {center: 0, deadzone: testInputFallbackAxisDeadzone, negativeName: "up", positiveName: "down"},
 		0x03: {center: 0, deadzone: testInputFallbackAxisDeadzone, negativeName: "left", positiveName: "right"},
 		0x04: {center: 0, deadzone: testInputFallbackAxisDeadzone, negativeName: "up", positiveName: "down"},
+	}
+}
+
+func possibleAnalogAxes() map[uint16]analogAxis {
+	axes := defaultAnalogAxes()
+	axes[0x02] = analogAxis{center: 0, deadzone: testInputFallbackAxisDeadzone, negativeName: "left", positiveName: "right"}
+	axes[0x05] = analogAxis{center: 0, deadzone: testInputFallbackAxisDeadzone, negativeName: "up", positiveName: "down"}
+	return axes
+}
+
+func optionalAnalogAxis(code uint16) bool {
+	switch code {
+	case 0x02, 0x05:
+		return true
+	default:
+		return false
 	}
 }
 
@@ -1198,6 +1226,14 @@ func analogCenterAndDeadzone(minimum, maximum, flat int32) (int32, int32) {
 	return int32(int64(minimum) + axisRange/2), deadzone
 }
 
+func axisValueNear(value, center, deadzone int32) bool {
+	delta := int64(value) - int64(center)
+	if delta < 0 {
+		delta = -delta
+	}
+	return delta <= int64(deadzone)
+}
+
 func readAbsInfo(file *os.File, code uint16) (inputAbsInfo, error) {
 	var info inputAbsInfo
 	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, file.Fd(), evIOCGRawAbs(code), uintptr(unsafe.Pointer(&info)))
@@ -1212,7 +1248,11 @@ func evIOCGRawAbs(code uint16) uintptr {
 }
 
 func (d *testInputDebouncer) shouldPrint(event inputEvent, now time.Time) (bool, string) {
-	if event.Type != evAbs || !isAnalogStickAxis(event.Code) {
+	if event.Type != evAbs {
+		return true, ""
+	}
+	_, isAnalog := d.axis(event.Code)
+	if !isAnalog {
 		return true, ""
 	}
 	if d.lastAnalogPrint == nil {
@@ -1240,10 +1280,7 @@ func (d *testInputDebouncer) shouldPrint(event inputEvent, now time.Time) (bool,
 }
 
 func (d *testInputDebouncer) analogDirection(event inputEvent) string {
-	axis, ok := d.axes[event.Code]
-	if !ok {
-		axis = defaultAnalogAxes()[event.Code]
-	}
+	axis, _ := d.axis(event.Code)
 	delta := int64(event.Value) - int64(axis.center)
 	if delta < 0 {
 		if -delta <= int64(axis.deadzone) {
@@ -1257,13 +1294,12 @@ func (d *testInputDebouncer) analogDirection(event inputEvent) string {
 	return axis.positiveName
 }
 
-func isAnalogStickAxis(code uint16) bool {
-	switch code {
-	case 0x00, 0x01, 0x03, 0x04:
-		return true
-	default:
-		return false
+func (d *testInputDebouncer) axis(code uint16) (analogAxis, bool) {
+	if axis, ok := d.axes[code]; ok {
+		return axis, true
 	}
+	axis, ok := defaultAnalogAxes()[code]
+	return axis, ok
 }
 
 func handleChord(path string, pressed map[uint16]bool, runtime *chordRuntime, debug bool) {
